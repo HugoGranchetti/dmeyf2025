@@ -1,1 +1,0 @@
-Competencia 1
