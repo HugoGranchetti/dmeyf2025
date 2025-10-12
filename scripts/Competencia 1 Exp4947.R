@@ -26,7 +26,7 @@ require("ParBayesianOptimization")
 # DEFINICIÓN DE PARÁMETROS
 # ============================================================
 PARAM <- list()
-PARAM$experimento <- 4946
+PARAM$experimento <- 4947
 PARAM$semilla_primigenia <- 907871
 
 # BAYESIAN OPTIMIZATION
@@ -34,6 +34,9 @@ PARAM$train <- c(202102, 202103)  # 2 meses para BO
 
 # EVALUACIÓN HOLDOUT
 PARAM$test_holdout <- c(202104)
+
+# TRAINING PARA SIMULACIÓN
+PARAM$train_simulacion <- c(202101, 202102, 202103)
 
 # TRAINING FINAL
 PARAM$train_final <- c(202101, 202102, 202103, 202104)
@@ -80,14 +83,14 @@ PARAM$lgbm$param_fijos <- list(
   extra_trees= FALSE
 )
 
-# Espacio de búsqueda (ParBayesianOptimization usa listas con bounds)
+# Espacio de búsqueda (ParBayesianOptimization)
 PARAM$hyperparametertuning$bounds <- list(
   num_iterations = c(500L, 3000L),
   learning_rate = c(0.005, 0.1),
   feature_fraction = c(0.1, 1.0),
   bagging_fraction = c(0.5, 1.0),
   num_leaves = c(10L, 200L),
-  min_data_in_leaf = c(500L, 4000L)
+  min_data_in_leaf = c(500L, 5000L)
 )
 
 PARAM$hyperparametertuning$iteraciones <- 70
@@ -159,9 +162,8 @@ EstimarGanancia_AUC_lightgbm <- function(num_iterations, learning_rate, feature_
   rm(modelocv)
   gc(full= TRUE, verbose= FALSE)
   
-  message(format(Sys.time(), "%a %b %d %X %Y"), " AUC ", round(AUC, 5))
+  message(format(Sys.time(), "%X"), " AUC: ", round(AUC, 5))
   
-  # ParBayesianOptimization requiere retornar lista con Score
   return(list(Score = AUC))
 }
 
@@ -206,9 +208,6 @@ for (v in vars_economicas) {
     frank(get(v), na.last = "keep", ties.method = "random")
   ), by = foto_mes]
 }
-
-cat("✅ Rankings creados:", length(vars_economicas), "features\n")
-cat("   (preservando solo 0s como 0, rankeando negativos)\n")
 
 # ────────────────────────────────────────────────────────────
 # LAGS Y DELTAS
@@ -282,14 +281,73 @@ cat("\n=== AJUSTANDO POR AGUINALDO DE JUNIO ===\n")
 dataset[, mes := foto_mes %% 100]
 dataset[, es_junio := ifelse(mes == 6, 1L, 0L)]
 
-# CALCULAR AGUINALDO ESTIMADO
+# ────────────────────────────────────────────────────────────
+# FEATURES DE NORMALIZACIÓN HISTÓRICA (ROBUSTAS)
+# ────────────────────────────────────────────────────────────
+
+# Media móvil 3 meses
+vars_normalizar <- c("mcaja_ahorro", "mpayroll", "mcuentas_saldo", "mactivos_margen")
+
+for (var in vars_normalizar) {
+  # Media móvil
+  var_media <- paste0(var, "_media_3m")
+  dataset[, (var_media) := frollmean(get(var), 3, align="right", na.rm=TRUE), 
+          by=numero_de_cliente]
+  
+  # Desviación estándar móvil
+  var_sd <- paste0(var, "_sd_3m")
+  dataset[, (var_sd) := frollapply(get(var), 3, sd, align="right", na.rm=TRUE), 
+          by=numero_de_cliente]
+  
+  # Ratio vs media histórica (ROBUSTO A SPIKES)
+  var_vs_media <- paste0(var, "_vs_media")
+  dataset[, (var_vs_media) := get(var) / (get(var_media) + 1)]
+  
+  # Z-score (cuánto se desvía de lo normal)
+  var_zscore <- paste0(var, "_zscore")
+  dataset[, (var_zscore) := (get(var) - get(var_media)) / (get(var_sd) + 1)]
+  
+  # Coeficiente de variación (volatilidad del cliente)
+  var_cv <- paste0(var, "_cv")
+  dataset[, (var_cv) := get(var_sd) / (get(var_media) + 1)]
+}
+
+# ────────────────────────────────────────────────────────────
+# FEATURES DE ESTABILIDAD
+# ────────────────────────────────────────────────────────────
+
+# ¿Cliente estable o volátil?
+dataset[, cliente_estable_caja := ifelse(mcaja_ahorro_cv < 0.3, 1L, 0L)]
+dataset[, cliente_estable_payroll := ifelse(mpayroll_cv < 0.3, 1L, 0L)]
+
+# ¿Valor actual es outlier respecto a historia?
+dataset[, mcaja_ahorro_outlier := ifelse(
+  abs(mcaja_ahorro_zscore) > 2, 1L, 0L
+)]
+
+dataset[, mpayroll_outlier := ifelse(
+  abs(mpayroll_zscore) > 2, 1L, 0L
+)]
+
+# Spike en cliente estable (más sospechoso)
+dataset[, spike_en_estable := ifelse(
+  cliente_estable_caja == 1L & mcaja_ahorro_outlier == 1L, 1L, 0L
+)]
+
+# ────────────────────────────────────────────────────────────
+# CALCULAR AGUINALDO ESTIMADO (PARA ANÁLISIS)
+# ────────────────────────────────────────────────────────────
+
 dataset[, mpayroll_max_6m := frollapply(mpayroll, 6, max, 
                                         align="right", fill=NA, na.rm=TRUE), 
         by=numero_de_cliente]
 
 dataset[, aguinaldo_estimado := mpayroll_max_6m * 0.5]
 
-# VARIABLES AJUSTADAS (sin aguinaldo)
+# ────────────────────────────────────────────────────────────
+# VARIABLES AJUSTADAS (CONSERVADOR: solo 30% en caja)
+# ────────────────────────────────────────────────────────────
+
 dataset[, mpayroll_base := ifelse(
   es_junio == 1L & !is.na(aguinaldo_estimado),
   pmax(mpayroll - aguinaldo_estimado, 0),
@@ -298,17 +356,20 @@ dataset[, mpayroll_base := ifelse(
 
 dataset[, mcaja_ahorro_base := ifelse(
   es_junio == 1L & !is.na(aguinaldo_estimado),
-  pmax(mcaja_ahorro - (aguinaldo_estimado * 0.8), 0),
+  pmax(mcaja_ahorro - (aguinaldo_estimado * 0.3), 0),
   mcaja_ahorro
 )]
 
 dataset[, mcuentas_saldo_base := ifelse(
   es_junio == 1L & !is.na(aguinaldo_estimado),
-  pmax(mcuentas_saldo - aguinaldo_estimado, 0),
+  pmax(mcuentas_saldo - (aguinaldo_estimado * 0.5), 0),
   mcuentas_saldo
 )]
 
-# RATIOS (robustos a aguinaldo)
+# ────────────────────────────────────────────────────────────
+# RATIOS (ya existentes, mantener)
+# ────────────────────────────────────────────────────────────
+
 vars_sensibles <- c("mcaja_ahorro", "mcuentas_saldo", "mpayroll", "mactivos_margen")
 
 for (var in vars_sensibles) {
@@ -323,7 +384,10 @@ for (var in vars_sensibles) {
   }
 }
 
+# ────────────────────────────────────────────────────────────
 # FLAGS Y FEATURES ADICIONALES
+# ────────────────────────────────────────────────────────────
+
 dataset[, tiene_spike_saldo := ifelse(
   mcaja_ahorro_ratio > 1.3 | mcuentas_saldo_ratio > 1.3, 1L, 0L
 )]
@@ -334,19 +398,14 @@ dataset[, spike_en_junio := ifelse(
 
 dataset[, mes_cat := as.integer(mes)]
 
-features_aguinaldo <- sum(grepl("_base$|_ratio$|_pct$|_normal$|aguinaldo|spike|mes_cat|es_junio", 
-                                names(dataset)))
-
-cat("Features para aguinaldo generadas:", features_aguinaldo, "\n\n")
-
 gc()
 
 # ============================================================
-# FASE 1: BAYESIAN OPTIMIZATION
+# BAYESIAN OPTIMIZATION
 # ============================================================
 
 cat("########################################\n")
-cat("FASE 1: BAYESIAN OPTIMIZATION\n")
+cat("BAYESIAN OPTIMIZATION\n")
 cat("########################################\n\n")
 
 cat("Meses para BO:", paste(PARAM$train, collapse=", "), "\n")
@@ -384,33 +443,54 @@ campos_buenos <- setdiff(
 
 cat("Features:", length(campos_buenos), "\n\n")
 
-# Crear dataset LightGBM (GLOBAL para que lo use la función de optimización)
+# Crear dataset LightGBM (GLOBAL)
 dtrain <<- lgb.Dataset(
   data= data.matrix(dataset_train[training == 1L, campos_buenos, with= FALSE]),
   label= dataset_train[training == 1L, clase01],
   free_raw_data= FALSE
 )
 
-# Ejecutar BO con ParBayesianOptimization
+# Ejecutar BO
 cat("Iniciando Bayesian Optimization con ParBayesianOptimization...\n")
-cat("Iteraciones:", PARAM$hyperparametertuning$iteraciones, "\n")
+cat("Iteraciones máximas:", PARAM$hyperparametertuning$iteraciones, "\n")
+cat("Early stopping después de", MAX_ITERS_SIN_MEJORA, "iters sin mejora\n")
 cat("Núcleos disponibles:", detectCores(), "\n")
-cat("ADVERTENCIA: Esto toma 2-3 horas (más rápido que mlrMBO)\n\n")
+cat("ADVERTENCIA: Esto toma 2-3 horas (o menos con early stopping)\n\n")
 
 set.seed(PARAM$semilla_primigenia, kind = "L'Ecuyer-CMRG")
 
-bayesiana_salida <- bayesOpt(
-  FUN = EstimarGanancia_AUC_lightgbm,
-  bounds = PARAM$hyperparametertuning$bounds,
-  initPoints = 10,  # Puntos aleatorios iniciales
-  iters.n = PARAM$hyperparametertuning$iteraciones,
-  iters.k = 1,
-  otherHalting = list(timeLimit = Inf),
-  acq = "ucb",  # Upper Confidence Bound
-  kappa = 2.576,
-  eps = 0.0,
-  verbose = 1
-)
+# Resetear contadores
+MEJOR_AUC_GLOBAL <<- 0
+ITERACIONES_SIN_MEJORA <<- 0
+
+# Wrapper para capturar early stopping
+bayesiana_salida <- tryCatch({
+  bayesOpt(
+    FUN = EstimarGanancia_AUC_lightgbm,
+    bounds = PARAM$hyperparametertuning$bounds,
+    initPoints = 10,
+    iters.n = PARAM$hyperparametertuning$iteraciones,
+    iters.k = 1,
+    otherHalting = list(timeLimit = Inf),
+    acq = "ucb",
+    kappa = 2.576,
+    eps = 0.0,
+    verbose = 1
+  )
+}, error = function(e) {
+  if (grepl("EARLY_STOPPING_TRIGGERED", e$message)) {
+    message("\n✅ Early stopping completado exitosamente")
+    return(NULL)
+  } else {
+    stop(e)
+  }
+})
+
+# Si hubo early stopping
+if (is.null(bayesiana_salida)) {
+  message("⚠️ Cargando resultados parciales de BO con early stopping...")
+  stop("Early stopping detectado pero no hay resultados guardados. Reduce iters.n manualmente.")
+}
 
 # Extraer mejores hiperparámetros
 tb_bayesiana <- as.data.table(bayesiana_salida$scoreSummary)
@@ -445,11 +525,11 @@ rm(dataset_train, dtrain)
 gc()
 
 # ============================================================
-# FASE 2: EVALUACIÓN EN HOLDOUT (202104)
+# EVALUACIÓN EN HOLDOUT (202104)
 # ============================================================
 
 cat("########################################\n")
-cat("FASE 2: EVALUACIÓN EN HOLDOUT\n")
+cat("EVALUACIÓN EN HOLDOUT\n")
 cat("########################################\n\n")
 
 cat("Evaluando hiperparámetros óptimos en 202104...\n\n")
@@ -658,11 +738,11 @@ rm(dataset_train_val, dataset_test_holdout)
 gc()
 
 # ============================================================
-# FASE 3: TRAINING FINAL
+# TRAINING FINAL
 # ============================================================
 
 cat("########################################\n")
-cat("FASE 3: TRAINING FINAL\n")
+cat("TRAINING FINAL\n")
 cat("########################################\n\n")
 
 setwd(file.path(RUTA_BASE, "exp"))
@@ -709,7 +789,7 @@ fwrite(tb_importancia, file= "impo.txt", sep= "\t")
 lgb.save(modelo_final, "modelo.txt")
 
 cat("\nTop 20 variables:\n")
-print(tb_importancia[1:20])
+print(tb_importancia[1:30])
 
 cat("\nFeatures nuevas de límites en top 50:\n")
 nuevas_top <- tb_importancia[1:50][Feature %like% "limite|Master.*pct|Visa.*pct|cancelada|reduccion"]
@@ -718,20 +798,59 @@ if(nrow(nuevas_top) > 0) {
 } else {
   cat("Ninguna feature nueva en top 50\n")
 }
+
+cat("\nFeatures de normalización (aguinaldo) en top 50:\n")
+aguinaldo_top <- tb_importancia[1:50][Feature %like% "_vs_media|_zscore|_cv|_outlier|cliente_estable"]
+if(nrow(aguinaldo_top) > 0) {
+  print(aguinaldo_top)
+} else {
+  cat("Ninguna feature de aguinaldo en top 50\n")
+}
 cat("\n")
 
 # ============================================================
-# FASE 4A: SIMULACIÓN EN 202104
+# SIMULACIÓN EN 202104
 # ============================================================
 
 cat("########################################\n")
-cat("FASE 4A: SIMULACIÓN (202104)\n")
+cat("SIMULACIÓN (202104)\n")
 cat("########################################\n\n")
 
-dsimulacion <- dataset[foto_mes %in% PARAM$simulacion]
-cat("Registros:", nrow(dsimulacion), "\n\n")
+cat("⚠️  IMPORTANTE: Entrenando modelo SIN 202104 para evitar leakage\n\n")
 
-pred_simulacion <- predict(modelo_final, 
+# Entrenar modelo SOLO con 202101-202103
+dataset_train_sim <- dataset[foto_mes %in% PARAM$train_simulacion]
+
+cat("Meses training simulación:", paste(PARAM$train_simulacion, collapse=", "), "\n")
+cat("Registros:", nrow(dataset_train_sim), "\n\n")
+
+dtrain_sim <- lgb.Dataset(
+  data= data.matrix(dataset_train_sim[, campos_buenos, with= FALSE]),
+  label= dataset_train_sim[, clase01]
+)
+
+# Usar hiperparámetros óptimos pero con datos de 202101-202103 solamente
+param_sim <- modifyList(PARAM$lgbm$param_fijos, 
+                        PARAM$out$lgbm$mejores_hiperparametros)
+
+# Ajustar min_data_in_leaf (sin undersampling en training final)
+param_sim$min_data_in_leaf <- round(
+  param_sim$min_data_in_leaf / PARAM$trainingstrategy$undersampling
+)
+
+# Ajustar scale_pos_weight
+n_pos_sim <- dataset_train_sim[clase01 == 1L, .N]
+n_neg_sim <- dataset_train_sim[clase01 == 0L, .N]
+param_sim$scale_pos_weight <- n_neg_sim / n_pos_sim
+
+cat("Entrenando modelo para simulación (sin 202104)...\n")
+modelo_sim <- lgb.train(data= dtrain_sim, param= param_sim, verbose= -1)
+
+# Ahora predecir en 202104 (out-of-sample)
+dsimulacion <- dataset[foto_mes %in% PARAM$simulacion]
+cat("Registros simulación (202104):", nrow(dsimulacion), "\n\n")
+
+pred_simulacion <- predict(modelo_sim, 
                            data.matrix(dsimulacion[, campos_buenos, with= FALSE]))
 
 tb_sim <- dsimulacion[, list(numero_de_cliente, foto_mes, clase_ternaria)]
@@ -773,7 +892,7 @@ setorder(resumen_sim, -total)
 mejor_sim <- resumen_sim[1]
 
 cat("\n========================================\n")
-cat("MEJOR ENVÍO (simulación)\n")
+cat("MEJOR ENVÍO\n")
 cat("========================================\n")
 cat("Envíos:", mejor_sim$envios, "\n")
 cat("Total: ", format(mejor_sim$total, big.mark=","), "\n")
@@ -781,30 +900,16 @@ cat("Public:", format(mejor_sim$public, big.mark=","), "\n")
 cat("Private:", format(mejor_sim$private, big.mark=","), "\n")
 cat("========================================\n\n")
 
-rm(dsimulacion, pred_simulacion, tb_sim, drealidad_sim)
+rm(dsimulacion, pred_simulacion, tb_sim, drealidad_sim, modelo_sim, dtrain_sim, dataset_train_sim)
 gc()
 
 # ============================================================
-# FASE 4B: PREDICCIÓN EN 202106
+# PREDICCIÓN EN 202106
 # ============================================================
 
 cat("########################################\n")
-cat("FASE 4B: PREDICCIÓN (202106)\n")
+cat("PREDICCIÓN (202106)\n")
 cat("########################################\n\n")
-
-# Comparar 202104 vs 202106
-cat("\n=== COMPARACIÓN 202104 (abr) vs 202106 (jun) ===\n")
-
-variables_clave <- c("mcaja_ahorro", "mpayroll", "mcuentas_saldo", 
-                     "mcaja_ahorro_base", "spike_en_junio")
-
-for (v in variables_clave) {
-  if (v %in% names(dataset)) {
-    cat("\n", v, ":\n")
-    cat("  202104: ", summary(dataset[foto_mes == 202104, get(v)]), "\n")
-    cat("  202106: ", summary(dataset[foto_mes == 202106, get(v)]), "\n")
-  }
-}
 
 dfuture <- dataset[foto_mes %in% PARAM$future]
 cat("Registros:", nrow(dfuture), "\n\n")
@@ -820,6 +925,7 @@ cat("Distribución probabilidades:\n")
 print(summary(tb_prediccion$prob))
 cat("\n")
 
+# Análisis por umbrales (informativo)
 umbral_conservador <- 0.10
 umbral_balanceado <- 0.05
 umbral_agresivo <- 0.01
@@ -832,9 +938,7 @@ cat("Clientes con prob >", umbral_conservador, ":", n_conservador, "\n")
 cat("Clientes con prob >", umbral_balanceado, ":", n_balanceado, "\n")
 cat("Clientes con prob >", umbral_agresivo, ":", n_agresivo, "\n\n")
 
-diff_bal <- abs(PARAM$cortes - n_balanceado)
-mejor_prob <- PARAM$cortes[which.min(diff_bal)]
-
+# Generar archivos Kaggle
 setorder(tb_prediccion, -prob)
 dir.create("kaggle", showWarnings = FALSE)
 
@@ -857,22 +961,59 @@ cat("########################################\n")
 cat("RECOMENDACIÓN DE SUBMISSION\n")
 cat("########################################\n\n")
 
-cat("OPCIÓN 1 - Simulación (202104):\n")
-cat("  Subir: KA", PARAM$experimento, "_", mejor_sim$envios, ".csv\n", sep="")
-cat("  Ganancia estimada:", format(mejor_sim$total, big.mark=","), "\n\n")
+cat("BASADO EN SIMULACIÓN:\n")
+cat("  🏆 MEJOR: KA", PARAM$experimento, "_", mejor_sim$envios, ".csv\n", sep="")
+cat("     Ganancia estimada: ", format(mejor_sim$total, big.mark=","), "\n\n", sep="")
 
-cat("OPCIÓN 2 - Probabilidades (202106):\n")
-cat("  Subir: KA", PARAM$experimento, "_", mejor_prob, ".csv\n", sep="")
-cat("  Umbral: prob >", umbral_balanceado, "\n\n")
-
-cat("TOP 3 ALTERNATIVAS:\n")
-for (i in 1:min(3, nrow(resumen_sim))) {
+cat("TOP 5 ALTERNATIVAS (por simulación):\n")
+for (i in 1:min(5, nrow(resumen_sim))) {
   cat("  ", i, ". KA", PARAM$experimento, "_", resumen_sim[i, envios], 
-      ".csv (", format(resumen_sim[i, total], big.mark=","), ")\n", sep="")
+      ".csv → $", format(resumen_sim[i, total], big.mark=","), "\n", sep="")
 }
 
-if (mejor_sim$envios == mejor_prob) {
-  cat("\n*** Ambos métodos coinciden en ", mejor_sim$envios, " envíos ***\n", sep="")
+cat("\n📊 ANÁLISIS DE UMBRALES (202106):\n")
+cat("  Umbral 0.10 → ", n_conservador, " clientes\n", sep="")
+cat("  Umbral 0.05 → ", n_balanceado, " clientes\n", sep="")
+cat("  Umbral 0.01 → ", n_agresivo, " clientes\n", sep="")
+
+cat("\n💡 IMPORTANTE:\n")
+cat("  ✅ Simulación SIN leakage (modelo entrenado sin 202104)\n")
+cat("  ✅ Esta simulación es más confiable que la anterior\n")
+cat("  ✅ Compara el óptimo simulado con tus resultados de Kaggle\n")
+
+cat("\n📈 COMPARACIÓN CON KAGGLE PÚBLICO:\n")
+cat("  Kaggle mejor público: 11,500 (score +9)\n")
+cat("  Simulación óptimo: ", mejor_sim$envios, "\n", sep="")
+
+diferencia_porcentual <- abs(mejor_sim$envios - 11500) / 11500 * 100
+
+if (diferencia_porcentual < 10) {
+  cat("  ✅ EXCELENTE: Simulación y público coinciden (±10%)\n")
+  cat("     → Confiar en simulación para elegir submissions finales\n")
+} else if (diferencia_porcentual < 20) {
+  cat("  ✅ BUENO: Simulación cercana al público (±20%)\n")
+  cat("     → Usar promedio entre simulación y público\n")
+} else {
+  cat("  ⚠️ GAP SIGNIFICATIVO: Simulación difiere >20% del público\n")
+  cat("     → Posible efecto aguinaldo (abril vs junio)\n")
+  cat("     → Considera usar público como guía principal\n")
+}
+
+if (mejor_sim$envios < 8000) {
+  cat("\n✅ ESTRATEGIA SUGERIDA (modelo conservador):\n")
+  cat("  1. Subir KA", PARAM$experimento, "_", mejor_sim$envios, ".csv (óptimo simulación)\n", sep="")
+  cat("  2. Subir KA", PARAM$experimento, "_", mejor_sim$envios + 1000, ".csv (exploración)\n", sep="")
+  cat("  3. Subir KA", PARAM$experimento, "_11500.csv (mejor público conocido)\n", sep="")
+} else if (mejor_sim$envios >= 8000 && mejor_sim$envios <= 13000) {
+  cat("\n✅ ESTRATEGIA SUGERIDA (modelo balanceado):\n")
+  cat("  1. Subir KA", PARAM$experimento, "_", mejor_sim$envios, ".csv (óptimo simulación)\n", sep="")
+  cat("  2. Subir KA", PARAM$experimento, "_", mejor_sim$envios - 500, ".csv (conservador)\n", sep="")
+  cat("  3. Subir KA", PARAM$experimento, "_", mejor_sim$envios + 500, ".csv (exploración)\n", sep="")
+} else {
+  cat("\n✅ ESTRATEGIA SUGERIDA (modelo agresivo):\n")
+  cat("  1. Subir KA", PARAM$experimento, "_", mejor_sim$envios, ".csv (óptimo simulación)\n", sep="")
+  cat("  2. Subir KA", PARAM$experimento, "_", mejor_sim$envios - 1000, ".csv (más conservador)\n", sep="")
+  cat("  3. Comparar con 11,500 (mejor público) para validar\n")
 }
 
 cat("\n########################################\n")
